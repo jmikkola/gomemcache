@@ -147,6 +147,36 @@ type Client struct {
 
 	lk       sync.Mutex
 	freeconn map[string][]*conn
+
+	metrics MemcachedConnectionsMeasurement
+}
+
+// MemcachedConnectionsMeasurement is a temporary hack to get data out of
+// this library
+type MemcachedConnectionsMeasurement struct {
+	// metrics for returning connections to the pool
+	ClosedByErrors int
+	ReturnedToPool int
+	ClosedPoolFull int
+
+	// metrics for getting a connection from the pool
+	GotExisting     int
+	GotNew          int
+	ErrorConnecting int
+}
+
+// GetAndResetMetrics returns the metrics recorded since the last
+// time this method was called.
+func (c *Client) GetAndResetMetrics() MemcachedConnectionsMeasurement {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
+	currentMetrics := c.metrics
+
+	var zeroValue MemcachedConnectionsMeasurement
+	c.metrics = zeroValue
+
+	return currentMetrics
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -195,8 +225,15 @@ func (cn *conn) condRelease(err *error) {
 	if *err == nil || resumableError(*err) {
 		cn.release()
 	} else {
+		cn.c.closingOnError()
 		cn.nc.Close()
 	}
+}
+
+func (c *Client) closingOnError() {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+	c.metrics.ClosedByErrors += 1
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
@@ -205,12 +242,16 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	if c.freeconn == nil {
 		c.freeconn = make(map[string][]*conn)
 	}
+
 	freelist := c.freeconn[addr.String()]
 	if len(freelist) >= c.maxIdleConns() {
 		cn.nc.Close()
+		c.metrics.ClosedPoolFull += 1
 		return
 	}
+
 	c.freeconn[addr.String()] = append(freelist, cn)
+	c.metrics.ReturnedToPool += 1
 }
 
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
@@ -223,8 +264,11 @@ func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
 	if !ok || len(freelist) == 0 {
 		return nil, false
 	}
+
 	cn = freelist[len(freelist)-1]
 	c.freeconn[addr.String()] = freelist[:len(freelist)-1]
+	c.metrics.GotExisting += 1
+
 	return cn, true
 }
 
@@ -279,6 +323,7 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 	}
 	nc, err := c.dial(addr)
 	if err != nil {
+		c.errorConnecting()
 		return nil, err
 	}
 	cn = &conn{
@@ -288,7 +333,20 @@ func (c *Client) getConn(addr net.Addr) (*conn, error) {
 		c:    c,
 	}
 	cn.extendDeadline()
+	c.gotNew()
 	return cn, nil
+}
+
+func (c *Client) errorConnecting() {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+	c.metrics.ErrorConnecting += 1
+}
+
+func (c *Client) gotNew() {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+	c.metrics.GotNew += 1
 }
 
 func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
